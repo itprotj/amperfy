@@ -223,7 +223,12 @@ actor DownloadManager: NSObject, DownloadManageable {
 
   @MainActor
   func download(objects: [Downloadable]) {
-    let downloadObjects = objects.filter { !isCheckForCachedNeeded || !$0.isCached }
+    // Saving a playlist, album or folder offline skips the songs unticked in Feishin (like an
+    // iTunes sync). A single song picked on its own still downloads.
+    let wanted = objects.count > 1
+      ? objects.filter { !UncheckedSongs.shared.contains(($0 as? AbstractPlayable)?.id) }
+      : objects
+    let downloadObjects = wanted.filter { !isCheckForCachedNeeded || !$0.isCached }
       .compactMap { $0.threadSafeInfo }
     guard !downloadObjects.isEmpty else { return }
 
@@ -560,6 +565,55 @@ actor DownloadManager: NSObject, DownloadManageable {
         )
         suspendDownloads()
       }
+    }
+  }
+}
+
+// MARK: - UncheckedSongs
+
+/// The songs unticked in Feishin (the Navidrome fork's iTunes-style tick boxes). Saved on the
+/// phone so offline saves still skip them when the server can't be reached.
+public final class UncheckedSongs: @unchecked Sendable {
+  public static let shared = UncheckedSongs()
+  /// Posted on the main thread whenever the set changes
+  public static let didChange = Notification.Name("UncheckedSongsDidChange")
+
+  private static let defaultsKey = "navidrome-unchecked-song-ids"
+  private let lock = NSLock()
+  private var ids: Set<String>
+
+  private init() {
+    ids = Set(UserDefaults.standard.stringArray(forKey: Self.defaultsKey) ?? [])
+  }
+
+  public func contains(_ id: String?) -> Bool {
+    guard let id else { return false }
+    lock.lock()
+    defer { lock.unlock() }
+    return ids.contains(id)
+  }
+
+  /// Replaces the whole set with the server's list
+  public func replaceAll(_ newIds: [String]) {
+    update { $0 = Set(newIds) }
+  }
+
+  public func set(_ songIds: [String], unchecked: Bool) {
+    update { ids in
+      if unchecked { ids.formUnion(songIds) } else { ids.subtract(songIds) }
+    }
+  }
+
+  private func update(_ change: (inout Set<String>) -> ()) {
+    lock.lock()
+    let before = ids
+    change(&ids)
+    let after = ids
+    lock.unlock()
+    guard after != before else { return }
+    UserDefaults.standard.set(Array(after), forKey: Self.defaultsKey)
+    DispatchQueue.main.async {
+      NotificationCenter.default.post(name: Self.didChange, object: nil)
     }
   }
 }

@@ -559,9 +559,20 @@ final class NavidromeFolderService {
   private func get<T: Decodable>(
     _ path: String,
     account: Account,
+    credentials: LoginCredentials
+  ) async throws -> T {
+    let data = try await send(path, method: "GET", body: nil, account: account, credentials: credentials)
+    return try JSONDecoder().decode(T.self, from: data)
+  }
+
+  private func send(
+    _ path: String,
+    method: String,
+    body: Data?,
+    account: Account,
     credentials: LoginCredentials,
     isRetry: Bool = false
-  ) async throws -> T {
+  ) async throws -> Data {
     let token: String
     if let cached = tokens[account.info.ident] {
       token = cached
@@ -572,17 +583,54 @@ final class NavidromeFolderService {
       throw NavidromeFolderError.noCredentials
     }
     var request = URLRequest(url: url)
+    request.httpMethod = method
     credentials.httpHeaders.forEach { request.setValue($0.value, forHTTPHeaderField: $0.key) }
     request.setValue("Bearer \(token)", forHTTPHeaderField: "x-nd-authorization")
+    if let body {
+      request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+      request.httpBody = body
+    }
     let (data, response) = try await URLSession.shared.data(for: request)
     let status = (response as? HTTPURLResponse)?.statusCode ?? 0
     if status == 401, !isRetry {
       // The token expired: log in again once
       tokens[account.info.ident] = nil
-      return try await get(path, account: account, credentials: credentials, isRetry: true)
+      return try await send(
+        path, method: method, body: body, account: account, credentials: credentials, isRetry: true
+      )
     }
     guard status == 200 else { throw NavidromeFolderError.badResponse(status) }
-    return try JSONDecoder().decode(T.self, from: data)
+    return data
+  }
+
+  // MARK: Tick boxes (set in Feishin; unticked songs are left out of offline saves)
+
+  private struct UncheckedSongsResponse: Decodable {
+    let unchecked: [String]
+  }
+
+  /// Fetches which songs are unticked, keeping the saved list if the server can't be reached
+  func refreshUncheckedSongs(for account: Account) async {
+    guard let credentials = appDelegate.storage.settings.accounts.getSetting(account.info).read
+      .loginCredentials else { return }
+    do {
+      let response: UncheckedSongsResponse = try await get(
+        "api/songCheck", account: account, credentials: credentials
+      )
+      UncheckedSongs.shared.replaceAll(response.unchecked)
+    } catch {
+      // Offline, or a Navidrome without tick boxes: keep what's saved
+    }
+  }
+
+  /// Ticks or unticks songs on the server
+  func setSongs(_ songIds: [String], checked: Bool, account: Account) async throws {
+    guard let credentials = appDelegate.storage.settings.accounts.getSetting(account.info).read
+      .loginCredentials else { throw NavidromeFolderError.noCredentials }
+    let body = try JSONSerialization.data(withJSONObject: ["ids": songIds, "checked": checked])
+    _ = try await send(
+      "api/songCheck", method: "PUT", body: body, account: account, credentials: credentials
+    )
   }
 }
 
@@ -681,6 +729,7 @@ final class PlaylistFoldersVC: UITableViewController {
       }
       do {
         self.tree = try await NavidromeFolderService.shared.refreshTree(for: self.account)
+        await NavidromeFolderService.shared.refreshUncheckedSongs(for: self.account)
       } catch {
         // Keep showing the saved folders (or a flat list) when Navidrome can't be reached
       }
@@ -724,6 +773,8 @@ final class PlaylistFoldersVC: UITableViewController {
     guard !ids.isEmpty else { return }
     let meta = appDelegate.getMeta(account.info)
     Task { @MainActor in
+      // Make sure the latest ticks from Feishin are used: unticked songs aren't downloaded
+      await NavidromeFolderService.shared.refreshUncheckedSongs(for: self.account)
       do {
         for id in ids {
           guard let playlist = self.appDelegate.storage.main.library

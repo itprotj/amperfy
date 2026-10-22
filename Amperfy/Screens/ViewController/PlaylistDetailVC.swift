@@ -229,6 +229,13 @@ class PlaylistDetailVC: SingleSnapshotFetchedResultsTableViewController<Playlist
       }
       self.detailOperationsView?.refresh()
     }
+    NotificationCenter.default.addObserver(
+      self, selector: #selector(uncheckedSongsChanged),
+      name: UncheckedSongs.didChange, object: nil
+    )
+    Task { @MainActor in
+      await NavidromeFolderService.shared.refreshUncheckedSongs(for: self.account)
+    }
   }
 
   func refreshBarButtons() {
@@ -282,8 +289,60 @@ class PlaylistDetailVC: SingleSnapshotFetchedResultsTableViewController<Playlist
     let cell: PlayableTableCell = dequeueCell(for: tableView, at: indexPath)
     if let song = playlistItem.playable.asSong {
       cell.display(playable: song, playContextCb: convertCellViewToPlayContext, rootView: self)
+      // Songs unticked in Feishin are faded, and aren't downloaded when saving offline
+      cell.contentView.alpha = UncheckedSongs.shared.contains(song.id) ? 0.4 : 1.0
+    } else {
+      cell.contentView.alpha = 1.0
     }
     return cell
+  }
+
+  // MARK: Tick boxes
+
+  @objc
+  private func uncheckedSongsChanged() {
+    guard isViewLoaded else { return }
+    let visible = tableView.indexPathsForVisibleRows ?? []
+    if !visible.isEmpty { tableView.reloadRows(at: visible, with: .none) }
+  }
+
+  /// Swipe right on a song to tick or untick it (the same tick boxes as Feishin)
+  override func tableView(
+    _ tableView: UITableView,
+    leadingSwipeActionsConfigurationForRowAt indexPath: IndexPath
+  )
+    -> UISwipeActionsConfiguration? {
+    let base = super.tableView(tableView, leadingSwipeActionsConfigurationForRowAt: indexPath)
+    guard !tableView.isEditing,
+          let song = fetchedResultsController.getWrappedEntity(at: indexPath).playable.asSong
+    else { return base }
+
+    let isUnticked = UncheckedSongs.shared.contains(song.id)
+    let action = UIContextualAction(
+      style: .normal,
+      title: isUnticked ? "Tick" : "Untick"
+    ) { [weak self] _, _, done in
+      self?.setSong(song.id, checked: isUnticked)
+      done(true)
+    }
+    action.image = UIImage(systemName: isUnticked ? "checkmark.circle" : "circle")
+    action.backgroundColor = isUnticked ? .systemGreen : .systemGray
+    return UISwipeActionsConfiguration(actions: [action] + (base?.actions ?? []))
+  }
+
+  private func setSong(_ songId: String, checked: Bool) {
+    UncheckedSongs.shared.set([songId], unchecked: !checked)
+    Task { @MainActor in
+      do {
+        try await NavidromeFolderService.shared.setSongs(
+          [songId], checked: checked, account: self.account
+        )
+      } catch {
+        // Put it back as it was
+        UncheckedSongs.shared.set([songId], unchecked: checked)
+        self.appDelegate.eventLogger.report(topic: "Tick Song", error: error)
+      }
+    }
   }
 
   override func updateSearchResults(for searchController: UISearchController) {
