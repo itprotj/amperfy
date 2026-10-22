@@ -598,10 +598,6 @@ final class PlaylistFoldersVC: UITableViewController {
   private var childFolders = [NavidromePlaylistFolder]()
   private var playlists = [Playlist]()
 
-  private var appDelegate: AppDelegate {
-    (UIApplication.shared.delegate as! AppDelegate)
-  }
-
   private var isRoot: Bool { folderId.isEmpty }
 
   private static let folderCellId = "PlaylistFolderCell"
