@@ -118,7 +118,13 @@ enum AppStoryboard: String {
   }
 
   func segueToPodcasts(account: Account) -> UIViewController { PodcastsVC(account: account) }
-  func segueToPlaylists(account: Account) -> UIViewController { PlaylistsVC(account: account) }
+  func segueToPlaylists(account: Account) -> UIViewController {
+    // Navidrome (Subsonic API): the iTunes-style folder tree from the Navidrome fork
+    if account.apiType.asServerApiType == .subsonic {
+      return PlaylistFoldersVC(account: account)
+    }
+    return PlaylistsVC(account: account)
+  }
   func segueToArtists(account: Account) -> UIViewController { ArtistsVC(account: account) }
   func segueToFavoriteArtists(account: Account)
     -> UIViewController { let artistsVC = ArtistsVC(account: account)

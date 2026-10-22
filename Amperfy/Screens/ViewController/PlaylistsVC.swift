@@ -400,3 +400,424 @@ class PlaylistsVC: SingleSnapshotFetchedResultsTableViewController<PlaylistMO> {
     updateContentUnavailable()
   }
 }
+
+// MARK: - Navidrome playlist folders
+
+/// A playlist folder from the Navidrome fork's native API (/api/playlistFolder). Folders belong to
+/// the logged-in user; an empty parentId means the folder is at the top level.
+struct NavidromePlaylistFolder: Codable, Hashable {
+  let id: String
+  let parentId: String
+  let name: String
+  let sortOrder: Int
+
+  private enum CodingKeys: String, CodingKey {
+    case id, parentId, name, sortOrder
+  }
+
+  init(from decoder: Decoder) throws {
+    let container = try decoder.container(keyedBy: CodingKeys.self)
+    id = try container.decode(String.self, forKey: .id)
+    parentId = try container.decodeIfPresent(String.self, forKey: .parentId) ?? ""
+    name = try container.decodeIfPresent(String.self, forKey: .name) ?? ""
+    sortOrder = try container.decodeIfPresent(Int.self, forKey: .sortOrder) ?? 0
+  }
+}
+
+/// Which folder a playlist is filed in. Playlists without an item are at the top level.
+struct NavidromePlaylistFolderItem: Codable, Hashable {
+  let playlistId: String
+  let folderId: String
+  let sortOrder: Int
+
+  private enum CodingKeys: String, CodingKey {
+    case playlistId, folderId, sortOrder
+  }
+
+  init(from decoder: Decoder) throws {
+    let container = try decoder.container(keyedBy: CodingKeys.self)
+    playlistId = try container.decode(String.self, forKey: .playlistId)
+    folderId = try container.decodeIfPresent(String.self, forKey: .folderId) ?? ""
+    sortOrder = try container.decodeIfPresent(Int.self, forKey: .sortOrder) ?? 0
+  }
+}
+
+struct NavidromeFolderTree: Codable {
+  var folders: [NavidromePlaylistFolder]
+  var items: [NavidromePlaylistFolderItem]
+
+  static let empty = NavidromeFolderTree(folders: [], items: [])
+
+  func childFolders(of parentId: String) -> [NavidromePlaylistFolder] {
+    folders
+      .filter { $0.parentId == parentId }
+      .sorted {
+        $0.sortOrder != $1.sortOrder
+          ? $0.sortOrder < $1.sortOrder
+          : $0.name.localizedStandardCompare($1.name) == .orderedAscending
+      }
+  }
+
+  /// Every playlist id filed in a folder or any folder inside it
+  func playlistIds(inTreeOf folderId: String) -> [String] {
+    var ids = items.filter { $0.folderId == folderId }.map(\.playlistId)
+    for child in childFolders(of: folderId) {
+      ids.append(contentsOf: playlistIds(inTreeOf: child.id))
+    }
+    return ids
+  }
+
+  func countPlaylists(inTreeOf folderId: String) -> Int {
+    playlistIds(inTreeOf: folderId).count
+  }
+}
+
+enum NavidromeFolderError: LocalizedError {
+  case noCredentials
+  case badResponse(Int)
+
+  var errorDescription: String? {
+    switch self {
+    case .noCredentials: return "No login details for this server."
+    case let .badResponse(status): return "Navidrome answered \(status)."
+    }
+  }
+}
+
+/// Reads the folder tree from Navidrome's native API and keeps a copy on the device, so folders
+/// still show when offline.
+@MainActor
+final class NavidromeFolderService {
+  static let shared = NavidromeFolderService()
+
+  private var tokens = [String: String]()
+
+  private var appDelegate: AppDelegate {
+    (UIApplication.shared.delegate as! AppDelegate)
+  }
+
+  private func cacheURL(for account: Account) -> URL? {
+    guard let dir = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)
+      .first else { return nil }
+    try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+    return dir.appendingPathComponent("navidrome-playlist-folders-\(account.info.ident).json")
+  }
+
+  func cachedTree(for account: Account) -> NavidromeFolderTree? {
+    guard let url = cacheURL(for: account),
+          let data = try? Data(contentsOf: url) else { return nil }
+    return try? JSONDecoder().decode(NavidromeFolderTree.self, from: data)
+  }
+
+  func refreshTree(for account: Account) async throws -> NavidromeFolderTree {
+    guard let credentials = appDelegate.storage.settings.accounts.getSetting(account.info).read
+      .loginCredentials else { throw NavidromeFolderError.noCredentials }
+
+    let folders: [NavidromePlaylistFolder] = try await get(
+      "api/playlistFolder", account: account, credentials: credentials
+    )
+    let items: [NavidromePlaylistFolderItem] = try await get(
+      "api/playlistFolder/items", account: account, credentials: credentials
+    )
+    let tree = NavidromeFolderTree(folders: folders, items: items)
+    if let url = cacheURL(for: account), let data = try? JSONEncoder().encode(tree) {
+      try? data.write(to: url, options: .atomic)
+    }
+    return tree
+  }
+
+  private func baseURL(_ credentials: LoginCredentials) -> String {
+    var base = credentials.activeBackendServerUrl.isEmpty
+      ? credentials.serverUrl
+      : credentials.activeBackendServerUrl
+    while base.hasSuffix("/") { base.removeLast() }
+    return base
+  }
+
+  private func login(account: Account, credentials: LoginCredentials) async throws -> String {
+    guard let url = URL(string: "\(baseURL(credentials))/auth/login") else {
+      throw NavidromeFolderError.noCredentials
+    }
+    var request = URLRequest(url: url)
+    request.httpMethod = "POST"
+    request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+    credentials.httpHeaders.forEach { request.setValue($0.value, forHTTPHeaderField: $0.key) }
+    request.httpBody = try JSONSerialization.data(withJSONObject: [
+      "username": credentials.username,
+      "password": credentials.password,
+    ])
+    let (data, response) = try await URLSession.shared.data(for: request)
+    let status = (response as? HTTPURLResponse)?.statusCode ?? 0
+    guard status == 200,
+          let json = try JSONSerialization.jsonObject(with: data) as? [String: Any],
+          let token = json["token"] as? String
+    else { throw NavidromeFolderError.badResponse(status) }
+    tokens[account.info.ident] = token
+    return token
+  }
+
+  private func get<T: Decodable>(
+    _ path: String,
+    account: Account,
+    credentials: LoginCredentials,
+    isRetry: Bool = false
+  ) async throws -> T {
+    let token: String
+    if let cached = tokens[account.info.ident] {
+      token = cached
+    } else {
+      token = try await login(account: account, credentials: credentials)
+    }
+    guard let url = URL(string: "\(baseURL(credentials))/\(path)") else {
+      throw NavidromeFolderError.noCredentials
+    }
+    var request = URLRequest(url: url)
+    credentials.httpHeaders.forEach { request.setValue($0.value, forHTTPHeaderField: $0.key) }
+    request.setValue("Bearer \(token)", forHTTPHeaderField: "x-nd-authorization")
+    let (data, response) = try await URLSession.shared.data(for: request)
+    let status = (response as? HTTPURLResponse)?.statusCode ?? 0
+    if status == 401, !isRetry {
+      // The token expired: log in again once
+      tokens[account.info.ident] = nil
+      return try await get(path, account: account, credentials: credentials, isRetry: true)
+    }
+    guard status == 200 else { throw NavidromeFolderError.badResponse(status) }
+    return try JSONDecoder().decode(T.self, from: data)
+  }
+}
+
+// MARK: - PlaylistFoldersVC
+
+/// The Playlists screen as a folder tree, like iTunes: the folders at this level, then the
+/// playlists filed here. The top level also shows every playlist that isn't in a folder.
+final class PlaylistFoldersVC: UITableViewController {
+  private let account: Account
+  private let folderId: String
+  private let folderName: String
+  private var tree = NavidromeFolderTree.empty
+  private var childFolders = [NavidromePlaylistFolder]()
+  private var playlists = [Playlist]()
+
+  private var appDelegate: AppDelegate {
+    (UIApplication.shared.delegate as! AppDelegate)
+  }
+
+  private var isRoot: Bool { folderId.isEmpty }
+
+  private static let folderCellId = "PlaylistFolderCell"
+
+  init(account: Account, folderId: String = "", folderName: String = "Playlists") {
+    self.account = account
+    self.folderId = folderId
+    self.folderName = folderName
+    super.init(style: .grouped)
+  }
+
+  required init?(coder: NSCoder) {
+    fatalError("init(coder:) is not supported")
+  }
+
+  override func viewDidLoad() {
+    super.viewDidLoad()
+    title = folderName
+    tableView.register(nibName: PlaylistTableCell.typeName)
+    tableView.register(UITableViewCell.self, forCellReuseIdentifier: Self.folderCellId)
+    tableView.backgroundColor = .backgroundColor
+    tableView.sectionHeaderHeight = 0.0
+    tableView.sectionFooterHeight = 0.0
+
+    #if !targetEnvironment(macCatalyst)
+      refreshControl = UIRefreshControl()
+      refreshControl?.addTarget(self, action: #selector(handleRefresh), for: .valueChanged)
+    #endif
+
+    var buttons = [UIBarButtonItem]()
+    if isRoot {
+      // The original list, with search and sorting, for every playlist
+      buttons.append(UIBarButtonItem(
+        image: UIImage(systemName: "list.bullet"),
+        primaryAction: UIAction { [weak self] _ in
+          guard let self else { return }
+          self.navigationController?.pushViewController(
+            PlaylistsVC(account: self.account),
+            animated: true
+          )
+        }
+      ))
+    } else {
+      buttons.append(UIBarButtonItem(
+        image: UIImage(systemName: "arrow.down.circle"),
+        primaryAction: UIAction { [weak self] _ in
+          guard let self else { return }
+          self.download(folderId: self.folderId, name: self.folderName)
+        }
+      ))
+    }
+    navigationItem.rightBarButtonItems = buttons
+
+    tree = NavidromeFolderService.shared.cachedTree(for: account) ?? .empty
+    rebuild()
+  }
+
+  override func viewWillAppear(_ animated: Bool) {
+    super.viewWillAppear(animated)
+    navigationController?.navigationBar.prefersLargeTitles = isRoot
+    rebuild()
+    refresh()
+  }
+
+  @objc
+  private func handleRefresh() {
+    refresh()
+  }
+
+  private func refresh() {
+    guard appDelegate.storage.settings.user.isOnlineMode else {
+      refreshControl?.endRefreshing()
+      return
+    }
+    Task { @MainActor in
+      do {
+        try await self.appDelegate.getMeta(self.account.info).librarySyncer
+          .syncDownPlaylistsWithoutSongs()
+      } catch {
+        self.appDelegate.eventLogger.report(topic: "Playlists Sync", error: error)
+      }
+      do {
+        self.tree = try await NavidromeFolderService.shared.refreshTree(for: self.account)
+      } catch {
+        // Keep showing the saved folders (or a flat list) when Navidrome can't be reached
+      }
+      self.rebuild()
+      self.refreshControl?.endRefreshing()
+    }
+  }
+
+  private func rebuild() {
+    let library = appDelegate.storage.main.library
+    childFolders = tree.childFolders(of: folderId)
+
+    if isRoot {
+      let filed = Set(tree.items.map(\.playlistId))
+      playlists = library.getPlaylists(for: account)
+        .filter { !filed.contains($0.id) }
+        .sorted { $0.name.localizedStandardCompare($1.name) == .orderedAscending }
+    } else {
+      playlists = tree.items
+        .filter { $0.folderId == folderId }
+        .sorted {
+          $0.sortOrder != $1.sortOrder ? $0.sortOrder < $1.sortOrder : $0.playlistId < $1.playlistId
+        }
+        .compactMap { library.getPlaylist(for: account, id: $0.playlistId) }
+    }
+    tableView.reloadData()
+
+    if childFolders.isEmpty, playlists.isEmpty {
+      var config = UIContentUnavailableConfiguration.empty()
+      config.image = isRoot ? .playlist : .folder
+      config.text = isRoot ? "No Playlists" : "Empty Folder"
+      contentUnavailableConfiguration = config
+    } else {
+      contentUnavailableConfiguration = nil
+    }
+  }
+
+  /// Downloads every song in every playlist in a folder (and the folders inside it)
+  private func download(folderId: String, name: String) {
+    let ids = tree.playlistIds(inTreeOf: folderId)
+    guard !ids.isEmpty else { return }
+    let meta = appDelegate.getMeta(account.info)
+    Task { @MainActor in
+      do {
+        for id in ids {
+          guard let playlist = self.appDelegate.storage.main.library
+            .getPlaylist(for: self.account, id: id) else { continue }
+          try await playlist.fetch(
+            storage: self.appDelegate.storage,
+            librarySyncer: meta.librarySyncer,
+            playableDownloadManager: meta.playableDownloadManager
+          )
+          meta.playableDownloadManager.download(objects: playlist.playables)
+        }
+        self.appDelegate.eventLogger.info(
+          topic: "Download Folder",
+          message: "Downloading the songs in \"\(name)\"."
+        )
+      } catch {
+        self.appDelegate.eventLogger.report(topic: "Download Folder", error: error)
+      }
+    }
+  }
+
+  // MARK: Table
+
+  override func numberOfSections(in tableView: UITableView) -> Int { 2 }
+
+  override func tableView(_ tableView: UITableView, numberOfRowsInSection section: Int) -> Int {
+    section == 0 ? childFolders.count : playlists.count
+  }
+
+  override func tableView(_ tableView: UITableView, heightForRowAt indexPath: IndexPath) -> CGFloat {
+    indexPath.section == 0 ? 52.0 : PlaylistTableCell.rowHeight
+  }
+
+  override func tableView(
+    _ tableView: UITableView,
+    cellForRowAt indexPath: IndexPath
+  )
+    -> UITableViewCell {
+    if indexPath.section == 0 {
+      let folder = childFolders[indexPath.row]
+      let cell = tableView.dequeueReusableCell(withIdentifier: Self.folderCellId, for: indexPath)
+      var content = UIListContentConfiguration.subtitleCell()
+      content.image = UIImage(systemName: "folder.fill")
+      content.imageProperties.tintColor = .secondaryLabel
+      content.text = folder.name
+      let count = tree.countPlaylists(inTreeOf: folder.id)
+      content.secondaryText = count == 1 ? "1 playlist" : "\(count) playlists"
+      content.secondaryTextProperties.color = .secondaryLabel
+      cell.contentConfiguration = content
+      cell.accessoryType = .disclosureIndicator
+      cell.backgroundColor = .clear
+      return cell
+    }
+    let cell: PlaylistTableCell = dequeueCell(for: tableView, at: indexPath)
+    cell.display(playlist: playlists[indexPath.row], rootView: self)
+    return cell
+  }
+
+  override func tableView(_ tableView: UITableView, didSelectRowAt indexPath: IndexPath) {
+    tableView.deselectRow(at: indexPath, animated: true)
+    if indexPath.section == 0 {
+      let folder = childFolders[indexPath.row]
+      navigationController?.pushViewController(
+        PlaylistFoldersVC(account: account, folderId: folder.id, folderName: folder.name),
+        animated: true
+      )
+    } else {
+      navigationController?.pushViewController(
+        AppStoryboard.Main.segueToPlaylistDetail(
+          account: account,
+          playlist: playlists[indexPath.row]
+        ),
+        animated: true
+      )
+    }
+  }
+
+  override func tableView(
+    _ tableView: UITableView,
+    trailingSwipeActionsConfigurationForRowAt indexPath: IndexPath
+  )
+    -> UISwipeActionsConfiguration? {
+    guard indexPath.section == 0 else { return nil }
+    let folder = childFolders[indexPath.row]
+    let action = UIContextualAction(style: .normal, title: "Download") { [weak self] _, _, done in
+      self?.download(folderId: folder.id, name: folder.name)
+      done(true)
+    }
+    action.image = UIImage(systemName: "arrow.down.circle")
+    action.backgroundColor = .systemBlue
+    return UISwipeActionsConfiguration(actions: [action])
+  }
+}
