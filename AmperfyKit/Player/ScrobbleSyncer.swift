@@ -41,6 +41,7 @@ public class ScrobbleSyncer {
   private var isRunning = false
   private var isActive = false
   private var scrobbleTimer: Timer?
+  private var pendingRetryTimer: Timer?
 
   // Track how long the song has actually been played
   private var accumulatedPlayTime: TimeInterval = 0
@@ -65,6 +66,26 @@ public class ScrobbleSyncer {
     self.storage = storage
     self.librarySyncer = librarySyncer
     self.eventLogger = eventLogger
+
+    // Plays made out of service are kept on the phone. Send them as soon as the connection is
+    // back, without waiting for the next song to finish.
+    for name in [Notification.Name.networkStatusChanged, .offlineModeChanged] {
+      NotificationCenter.default.addObserver(forName: name, object: nil, queue: .main) { [weak self] _ in
+        Task { @MainActor in self?.retryPendingScrobbles() }
+      }
+    }
+    // And keep trying every couple of minutes: the phone can show signal while the server still
+    // can't be reached (weak coverage), which doesn't count as a change of connection
+    pendingRetryTimer = Timer.scheduledTimer(withTimeInterval: 120, repeats: true) { [weak self] _ in
+      Task { @MainActor in self?.retryPendingScrobbles() }
+    }
+  }
+
+  /// Uploads plays saved while offline, when there are any and the phone is online
+  private func retryPendingScrobbles() {
+    guard !isActive, storage.settings.user.isOnlineMode,
+          networkMonitor.isConnectedToNetwork else { return }
+    start()
   }
 
   public func start() {
