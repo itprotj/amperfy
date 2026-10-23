@@ -149,6 +149,12 @@ public class Song: AbstractPlayable, Identifyable {
       if let genre = genre {
         infoContent.append("Genre: \(genre.name)")
       }
+      infoContent.append(playCount == 1 ? "1 Play" : "\(playCount) Plays")
+      if let lastTimePlayed {
+        infoContent.append(
+          "Last Played: \(lastTimePlayed.formatted(date: .abbreviated, time: .omitted))"
+        )
+      }
       if details.isShowDetailedInfo {
         if bitrate > 0 {
           infoContent.append("Bitrate: \(bitrate)")

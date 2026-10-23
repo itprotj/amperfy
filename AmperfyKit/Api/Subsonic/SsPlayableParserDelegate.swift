@@ -74,6 +74,19 @@ class SsPlayableParserDelegate: SsXmlLibWithArtworkParser {
       if let attributeDuration = attributeDict["duration"], let duration = Int(attributeDuration) {
         playableBuffer?.remoteDuration = duration
       }
+      // Plays counted by the server (from every app, e.g. Feishin). Plays made on this phone
+      // while offline are uploaded later, so the higher count is kept until then.
+      if let attributePlayCount = attributeDict["playCount"],
+         let serverCount = Int(attributePlayCount),
+         let playable = playableBuffer, serverCount > playable.playCount {
+        playable.playCount = serverCount
+      }
+      if let attributePlayed = attributeDict["played"],
+         let serverPlayed = Self.parseServerDate(attributePlayed),
+         let playable = playableBuffer,
+         playable.lastTimePlayed.map({ serverPlayed > $0 }) ?? true {
+        playable.lastTimePlayed = serverPlayed
+      }
       if let attributeSize = attributeDict["size"], let size = Int(attributeSize) {
         playableBuffer?.size = size
       }
@@ -130,5 +143,14 @@ class SsPlayableParserDelegate: SsXmlLibWithArtworkParser {
       isCached = isCached && playable.isCached
     }
     playableBuffer = nil
+  }
+
+  /// Reads a server date such as 2026-10-22T08:31:35.123Z (with or without fractions of a second)
+  static func parseServerDate(_ text: String) -> Date? {
+    let formatter = ISO8601DateFormatter()
+    formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+    if let date = formatter.date(from: text) { return date }
+    formatter.formatOptions = [.withInternetDateTime]
+    return formatter.date(from: text)
   }
 }
